@@ -2,18 +2,28 @@
 #define MONITORS_H
 
 #include <Arduino.h>
-#include "config.h"
 #include "driver_io.h"
+#include "runtime_state.h"
 
-// Provided by main.ino
+// Optionally echo to Ethernet client like other prints
 extern EthernetClient client;
-extern bool pollEnabled[23];
 
-// ─── Motion-state monitor (on-demand poll) ──────────────────────────
+/* Helper: unified status line like "m1, pos=..., lo=..., hi=..., lim=..." */
+static inline String fmtStatusLine(uint8_t id) {
+  MotorState &m = mById(id);
+  String lo = m.hasLower ? String(m.lower) : String("unset");
+  String hi = m.hasUpper ? String(m.upper) : String("unset");
+  const char *lim = "none";
+  if (m.blockNeg) lim = "neg";
+  else if (m.blockPos) lim = "pos";
+  return "m" + String(id) + ", pos=" + String(m.position) + ", lo=" + lo + ", hi=" + hi + ", lim=" + lim;
+}
+
+/* ── Motion-state monitor (unchanged logic) ───────────────────────── */
 static inline void monitorMotionStates() {
   static uint32_t lastPoll = 0;
   static uint8_t  nextId   = 1;
-  static uint16_t prev[23]  = {0xFFFF, 0xFFFF, 0xFFFF};
+  static uint16_t prev[23] = {0xFFFF, 0xFFFF, 0xFFFF};
 
   if (millis() - lastPoll < 50) return;
   lastPoll = millis();
@@ -22,6 +32,7 @@ static inline void monitorMotionStates() {
   uint8_t id = 0;
   for (uint8_t i = 0; i < 22; ++i) {
     uint8_t cand = nextId;
+    extern bool pollEnabled[23];
     if (pollEnabled[cand]) { id = cand; break; }
     nextId = (nextId == 22) ? 1 : (uint8_t)(nextId + 1);
   }
@@ -29,10 +40,8 @@ static inline void monitorMotionStates() {
 
   uint16_t ms = readReg(id, 0x1003);
   if (ms != 0xFFFF && (ms == 0x0006 || ms == 0x0032) && ms != prev[id]) {
-    // Serial message (unchanged)
     Serial.print("Motor-"); Serial.print(id);
     Serial.print(" motion-state 0x1003 changed: 0x"); Serial.println(ms, HEX);
-    // Ethernet echo immediately after
     client.print("Motor-"); client.print(id);
     client.print(" motion-state 0x1003 changed: 0x"); client.println(ms, HEX);
   }
@@ -42,7 +51,14 @@ static inline void monitorMotionStates() {
   nextId = (id == 22) ? 1 : (uint8_t)(id + 1);
 }
 
-// ─── Limit-switch polling ONLY for M1 and M2 ────────────────────────
+/* ── Limit-switch polling ONLY for M1 and M2, with live direction lock ───
+   While PRESSED:
+     lastDir < 0  → blockNeg=true, blockPos=false
+     lastDir > 0  → blockPos=true, blockNeg=false
+     lastDir = 0  → no blocks
+   When RELEASED: clear both blocks.
+   Each change sends a concise status line over Ethernet.
+*/
 static const uint8_t kLimitPollIds[] = { 1, 2 };
 static const uint8_t kLimitPollCount = sizeof(kLimitPollIds) / sizeof(kLimitPollIds[0]);
 static uint8_t  lsInited[23]      = {0};
@@ -68,10 +84,35 @@ static inline void monitorLimitSwitches_M12() {
     }
     uint8_t pressed = (di2 != lsIdleLevel[id]);     // engaged = deviates from idle
 
-    if (pressed && !lsPrevPressed[id]) {
-      Serial.print("limit hit for M"); Serial.println(id);
-      client.print("limit hit for M"); client.println(id);
+    MotorState &m = mById(id);
+    bool changed = (pressed != lsPrevPressed[id]);
+
+    if (pressed) {
+      if (m.lastDir < 0) {
+        if (!m.blockNeg || m.blockPos) changed = true;
+        m.blockNeg = true;
+        m.blockPos = false;
+      } else if (m.lastDir > 0) {
+        if (!m.blockPos || m.blockNeg) changed = true;
+        m.blockPos = true;
+        m.blockNeg = false;
+      } else {
+        if (m.blockNeg || m.blockPos) changed = true;
+        m.blockNeg = false;
+        m.blockPos = false;
+      }
+    } else {
+      if (m.blockNeg || m.blockPos) changed = true;
+      m.blockNeg = false;
+      m.blockPos = false;
     }
+
+    if (changed) {
+      String s = fmtStatusLine(id);
+      Serial.println(s);
+      client.println(s);
+    }
+
     lsPrevPressed[id] = pressed;
 
     delayMicroseconds(5000);                        // modest RS-485 guard
